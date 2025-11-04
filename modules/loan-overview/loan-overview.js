@@ -49,6 +49,7 @@
       var ctrl = this;
       ctrl.apiResponses = [];
       ctrl.currentInstitution = null;
+      ctrl.completedInstitutions = []; // Track completed institutions with counts
 
       $timeout(function () {
         const dialog = document.querySelector("dialog");
@@ -59,8 +60,7 @@
           showButton.addEventListener("click", () => {
             if (dialog) dialog.showModal();
             ctrl.clearAllData();
-            document.getElementById("status-message").innerHTML =
-              "<p>loading...</p><p>Please be patient while we are gathering information for you.</p>";
+            ctrl.updateStatusMessage("Loading active institutions...");
             ctrl
               .clickThroughWithApiMonitoring({
                 delay: 3000,
@@ -113,11 +113,173 @@
         }
       }, 100);
 
+      // Helper function to update status message with current progress
+      ctrl.updateStatusMessage = function (currentMessage) {
+        const statusMessageDiv = document.getElementById("status-message");
+        if (!statusMessageDiv) return;
+
+        let html = `<p>${currentMessage}</p>`;
+
+        // Add completed institutions list if any
+        if (ctrl.completedInstitutions.length > 0) {
+          html += '<div style="margin-top: 1rem;">';
+          ctrl.completedInstitutions.forEach((inst) => {
+            html += `<p>${inst.name}: ${inst.count} items loaded</p>`;
+          });
+          html += '</div>';
+        }
+
+        statusMessageDiv.innerHTML = html;
+      };
+
+      // Helper function to count loans for a specific institution
+      ctrl.countLoansForInstitution = function (institutionName) {
+        const responses = ctrl.apiResponses.filter(
+          (r) => r.institution && r.institution.name === institutionName
+        );
+        const loanIds = new Set();
+        responses.forEach((response) => {
+          const loans = response?.data?.data?.loans?.loan;
+          if (loans && Array.isArray(loans)) {
+            loans.forEach((loan) => {
+              const id = loan.loanid || loan.itemid;
+              if (id) loanIds.add(id);
+            });
+          }
+        });
+        return loanIds.size;
+      };
+
+      // Helper function to check if the latest response has showmore = "Y"
+      ctrl.checkShowMore = function () {
+        // Check the most recent API response for this institution
+        const recentResponses = ctrl.apiResponses.filter(
+          (r) =>
+            r.institution &&
+            ctrl.currentInstitution &&
+            r.institution.name === ctrl.currentInstitution.name
+        );
+        if (recentResponses.length === 0) return false;
+        const latestResponse = recentResponses[recentResponses.length - 1];
+        const showmore = latestResponse?.data?.data?.loans?.showmore;
+        return showmore && showmore[0] === "Y";
+      };
+
+      // Helper function to find and click the "Load more results" button
+      ctrl.clickLoadMoreButton = function () {
+        return new Promise((resolve, reject) => {
+          $timeout(() => {
+            const loadMoreButton = document.querySelector(
+              'button[ng-transclude][translate="nui.brief.results.loadMore"]'
+            );
+            if (loadMoreButton) {
+              loadMoreButton.click();
+              resolve(true);
+            } else {
+              reject(new Error("Load more button not found"));
+            }
+          }, 500);
+        });
+      };
+
+      // Helper function to get loan IDs from a response
+      ctrl.getLoanIds = function (responseData) {
+        const loans = responseData?.data?.data?.loans?.loan;
+        if (!loans || !Array.isArray(loans)) return [];
+        return loans.map((loan) => loan.loanid || loan.itemid);
+      };
+
+      // Main pagination handler - loads all loans for current institution
+      ctrl.loadAllLoansForCurrentInstitution = function (delay = 2000) {
+        return new Promise((resolve) => {
+          const seenLoanIds = new Set();
+          let attemptCount = 0;
+          const maxAttempts = 20; // Safety limit to prevent infinite loops
+
+          // Collect initial loan IDs
+          const initialResponses = ctrl.apiResponses.filter(
+            (r) =>
+              r.institution &&
+              ctrl.currentInstitution &&
+              r.institution.name === ctrl.currentInstitution.name
+          );
+          initialResponses.forEach((response) => {
+            ctrl.getLoanIds(response).forEach((id) => seenLoanIds.add(id));
+          });
+
+          function loadMoreIfNeeded() {
+            attemptCount++;
+            if (attemptCount > maxAttempts) {
+              console.warn(
+                "Max pagination attempts reached for",
+                ctrl.currentInstitution?.name
+              );
+              resolve();
+              return;
+            }
+
+            // Check if we need to load more
+            if (ctrl.checkShowMore()) {
+              ctrl
+                .clickLoadMoreButton()
+                .then(() => {
+                  // Wait for API response to be captured
+                  $timeout(() => {
+                    // Get the latest response and check for new items
+                    const latestResponses = ctrl.apiResponses.filter(
+                      (r) =>
+                        r.institution &&
+                        ctrl.currentInstitution &&
+                        r.institution.name === ctrl.currentInstitution.name
+                    );
+                    if (latestResponses.length > 0) {
+                      const latestResponse =
+                        latestResponses[latestResponses.length - 1];
+                      const newLoanIds = ctrl.getLoanIds(latestResponse);
+
+                      // Add new unique loan IDs
+                      let hasNewLoans = false;
+                      newLoanIds.forEach((id) => {
+                        if (!seenLoanIds.has(id)) {
+                          seenLoanIds.add(id);
+                          hasNewLoans = true;
+                        }
+                      });
+
+                      if (hasNewLoans) {
+                        // Continue loading more
+                        $timeout(loadMoreIfNeeded, delay);
+                      } else {
+                        // No new loans, we're done
+                        resolve();
+                      }
+                    } else {
+                      // Try again if no response yet
+                      $timeout(loadMoreIfNeeded, delay);
+                    }
+                  }, delay);
+                })
+                .catch(() => {
+                  // Load more button not found or error, we're done
+                  resolve();
+                });
+            } else {
+              // No more items to load (showmore is "N" or not present)
+              resolve();
+            }
+          }
+
+          // Start the pagination loop
+          loadMoreIfNeeded();
+        });
+      };
+
       ctrl.clickThroughActiveInstitutions = function (options = {}) {
         const {
           delay = 2000,
           onInstitutionClick = null,
           onComplete = null,
+          handlePagination = false,
         } = options;
         const activeInstitutions = document.querySelectorAll(
           'md-list-item:has([aria-label="Has activity"]) .institution-name'
@@ -144,6 +306,12 @@
             hasActivity: true,
           });
           button.click();
+
+          // Update status message to show we're loading this institution
+          $timeout(() => {
+            ctrl.updateStatusMessage(`Loading loans from ${institutionName}...`);
+          }, 100);
+
           if (onInstitutionClick) {
             onInstitutionClick({
               index: currentIndex,
@@ -153,7 +321,29 @@
             });
           }
           currentIndex++;
-          $timeout(clickNextActive, delay);
+
+          if (handlePagination) {
+            // Wait for initial load, then handle pagination before moving to next institution
+            $timeout(() => {
+              ctrl.loadAllLoansForCurrentInstitution(delay).then(() => {
+                // Count loans and add to completed list
+                const loanCount = ctrl.countLoansForInstitution(institutionName);
+                ctrl.completedInstitutions.push({
+                  name: institutionName,
+                  count: loanCount
+                });
+
+                // Update status before moving to next
+                if (currentIndex < activeInstitutions.length) {
+                  ctrl.updateStatusMessage(`Loading loans from next institution...`);
+                }
+
+                $timeout(clickNextActive, delay);
+              });
+            }, delay);
+          } else {
+            $timeout(clickNextActive, delay);
+          }
         }
         clickNextActive();
       };
@@ -255,6 +445,7 @@
           }
           ctrl.clickThroughActiveInstitutions({
             delay,
+            handlePagination: true, // Enable pagination support
             onInstitutionClick: () => {},
             onComplete: () => {
               if (monitorApi) {
@@ -428,6 +619,7 @@
       ctrl.clearAllData = function () {
         ctrl.apiResponses = [];
         ctrl.currentInstitution = null;
+        ctrl.completedInstitutions = [];
         const statusMessage = document.getElementById("status-message");
         if (statusMessage) {
           statusMessage.innerHTML = "";
